@@ -1,0 +1,6 @@
+zig-out/
+.zig-cache/
+massif.out.*
+*.perf
+hs
+enwik8
