@@ -4,14 +4,15 @@ const GPA = _GPA.allocator();
 var STDERR = std.io.getStdErr().writer();
 var STDOUT = std.io.getStdOut().writer();
 
+const ASCII_DELIMS = [_]u8{
+  '"', '\'', '*', '+', '-', '%', '\\', '/', ' ', ',', '(', ')', '[', ']', '{',
+  '}', '<', '>', '`', '|', '=', ':', ';', '\t', '\n', '\r', 0,
+};
+
 fn isDelimiter(b: u8) bool
 {
-  switch (b) {
-    '"', '\'', '*', '+', '-', '%', '\\', '/', ' ', ',', '(', ')', '[', ']', '{',
-    '}', '<', '>', '`', '|', '=', ':', ';', '\t', '\n', '\r', 0
-      => return true,
-    else => return false,
-  }
+  if (std.mem.indexOfScalar(u8, &ASCII_DELIMS, b)) |_| return true;
+  return false;
 }
 
 const WordMap = std.StringHashMap(u64);
@@ -29,47 +30,112 @@ fn parseFileToWordMap(scratch_arena: *std.heap.ArenaAllocator,
 {
   defer _ = scratch_arena.reset(.retain_capacity);
   const scratch_allocator = scratch_arena.allocator();
+
   var read_buf = std.ArrayList(u8).init(scratch_allocator);
-  try read_buf.resize(std.heap.pageSize() * 16);
+  try read_buf.resize(std.heap.pageSize() * 64);
+
   var word_buf = try std.ArrayList(u8).initCapacity(scratch_allocator, 16);
   var n_read = try file_reader.read(read_buf.items);
   var truncated_buf: [3]u8 = undefined;
   var truncated_cp_sz = @as(u3, 0);
+
+  // comptime simd constants.
+  const lane_width = 16;
+  const SimdLane = comptime @Vector(lane_width, u8);
+  const ascii_mask: SimdLane = comptime @splat(0x80);
+  // build one splat per delimiter once.
+  comptime var delim_splats: [ASCII_DELIMS.len]SimdLane = undefined;
+  comptime {
+    for (&delim_splats, ASCII_DELIMS) |*dst, c| dst.* = @splat(c);
+  }
+
   while (n_read > 0) {
-    var cp_start = @as(u64, 0);
-    while (cp_start < n_read) {
-      var cp_sz: u3 = undefined;
-      var cp: []u8 = undefined;
-      if (!std.ascii.isAscii(read_buf.items[cp_start])) {
-        // unicode path.
-        // 1. find out codepoint length.
-        cp_sz =
-          std.unicode.utf8ByteSequenceLength(read_buf.items[cp_start]) catch {
-            cp_start += 1;
-            continue;
-          };
-        std.debug.assert(cp_sz <= 4);
-        const cp_end = cp_start + cp_sz;
-        // special case: codepoint was truncated and is partially present.
-        // remember the initial part and get out.
-        if (cp_end > n_read) {
-          @memcpy(
-            truncated_buf[0..n_read-cp_start], read_buf.items[cp_start..n_read]);
-          truncated_cp_sz = cp_sz;
-          break;
-        }
-        // 2. retrieve the codepoint.
-        cp = read_buf.items[cp_start..cp_end];
-        // 3. validate the codepoint.
-        if (!std.unicode.utf8ValidateSlice(cp)) {
-          cp_start += 1;
+    var buf_idx = @as(u64, 0);
+
+    while (buf_idx < n_read) {
+      // simd ascii path.
+      if (std.ascii.isAscii(read_buf.items[buf_idx]) and
+          buf_idx + lane_width < n_read)
+      ascii: {
+        // load a lane.
+        const lane: *align(1) const SimdLane =
+          @ptrCast(read_buf.items.ptr + buf_idx);
+        const lane_end = buf_idx + lane_width;
+
+        // make sure the entire lane is ascii.
+        if (@reduce(.Or, lane.* & ascii_mask) != 0) break :ascii;
+
+        var mask: u16 = 0; // must match lane_width.
+        // build delimiter mask OR-ing every comparison.
+        inline for (delim_splats) |d| mask |= @bitCast(lane.* == d);
+        if (mask == 0) {
+          // hooray, no delimiters in lane. append the entire buffer.
+          try word_buf.appendSlice(read_buf.items[buf_idx..lane_end]);
+          buf_idx += lane_width;
           continue;
         }
-      } else {
-        // ascii path.
-        cp_sz = 1;
-        cp = read_buf.items[cp_start..cp_start+1];
+
+        // slow-path: walk the 16 bytes, guided by the mask.
+        var lane_idx: u8 = 0;
+        var prev_buf_idx: u64 = buf_idx;
+
+        while (lane_idx < lane_width) : ({ mask >>= 1; lane_idx += 1; }) {
+          // wait for the delimiter.
+          if (mask & 1 == 0) continue;
+
+          const lane_off = buf_idx + lane_idx;
+          std.debug.assert(prev_buf_idx <= lane_off);
+
+          try word_buf.appendSlice(read_buf.items[prev_buf_idx..lane_off]);
+          if (word_buf.items.len != 0) {
+            try addWordToWordMap(word_map, word_buf.items);
+            word_buf.clearRetainingCapacity();
+          }
+
+          const byte = read_buf.items[lane_off];
+
+          // append the delimiter itself.
+          if (!std.ascii.isWhitespace(byte) and !std.ascii.isControl(byte))
+            try addWordToWordMap(word_map, &[1]u8{byte});
+
+          prev_buf_idx = lane_off + 1;
+        }
+
+        if (prev_buf_idx < lane_end)
+          try word_buf.appendSlice(read_buf.items[prev_buf_idx..lane_end]);
+
+        buf_idx += lane_width;
+
+        continue;
       }
+
+      // scalar/unicode path.
+
+      // 1. find out codepoint length.
+      const cp_sz =
+        std.unicode.utf8ByteSequenceLength(read_buf.items[buf_idx]) catch {
+          buf_idx += 1;
+          continue;
+        };
+      std.debug.assert(cp_sz <= 4);
+      const cp_end = buf_idx + cp_sz;
+      // special case: codepoint was truncated and is partially present.
+      // remember the initial part and get out.
+      if (cp_end > n_read) {
+        @memcpy(
+          truncated_buf[0..n_read-buf_idx], read_buf.items[buf_idx..n_read]);
+        truncated_cp_sz = cp_sz;
+        break;
+      }
+
+      // 2. retrieve the codepoint.
+      const cp = read_buf.items[buf_idx..cp_end];
+      // 3. validate the codepoint.
+      if (!std.unicode.utf8ValidateSlice(cp)) {
+        buf_idx += 1;
+        continue;
+      }
+
       // 4. check whether codepoint is a delimiter.
       if (isDelimiter(cp[0])) {
         // add a word we collected to the word map.
@@ -84,17 +150,21 @@ fn parseFileToWordMap(scratch_arena: *std.heap.ArenaAllocator,
         // or append this codepoint to word buffer.
         try word_buf.appendSlice(cp);
       }
-      cp_start += cp_sz;
+
+      buf_idx += cp_sz;
     }
+
     // read again. if the truncated buffer is not empty, put's it's contents in
     // the beginning.
     n_read = try file_reader.read(read_buf.items[truncated_cp_sz..]);
+
     if (truncated_cp_sz > 0) {
       @memcpy(
         read_buf.items[0..truncated_cp_sz], truncated_buf[0..truncated_cp_sz]);
       truncated_cp_sz = 0;
     }
   }
+
   if (word_buf.items.len > 0) try addWordToWordMap(word_map, word_buf.items);
 }
 
@@ -119,15 +189,18 @@ fn printWordMap(scratch_arena: *std.heap.ArenaAllocator,
 {
   const sorted_wordmap = try sortWordMapEntries(scratch_arena, word_map);
   defer _ = scratch_arena.reset(.retain_capacity);
+
   var stdout = std.io.bufferedWriter(STDOUT);
   var total_count = @as(u64, 0);
   var stdout_writer = stdout.writer();
+
   for (sorted_wordmap.items) |e| {
     _ = try stdout_writer
                   .print("{}\t\t{s}\n", .{ e.value_ptr.*, e.key_ptr.* });
     total_count += e.value_ptr.*;
   }
   _ = try stdout_writer.print("{}\n", .{ total_count });
+
   try stdout.flush();
 }
 
@@ -153,10 +226,12 @@ fn error_main() !void
 {
   var word_map = WordMap.initContext(GPA, .{});
   defer word_map.deinit();
+
   var scratch_arena = std.heap.ArenaAllocator.init(GPA);
   var args = try std.process.argsWithAllocator(GPA);
   // skip program name.
   const program_name = args.next().?;
+
   while (args.next()) |arg| {
     if (streq(arg, "--help")) return help(program_name);
     // "-" is stdin.
@@ -164,14 +239,18 @@ fn error_main() !void
       std.io.getStdIn()
     else
       try std.fs.cwd().openFile(arg, .{ .mode = .read_only });
+
     defer file.close();
+
     // preallocate some memory based on a file size.
     const stat = try file.stat();
     const estimated_entries: u32 = @truncate(stat.size / 6);
     try word_map.ensureTotalCapacity(estimated_entries);
+
     var any_file_reader = file.reader().any();
     try parseFileToWordMap(&scratch_arena, &word_map, &any_file_reader);
   }
+
   try printWordMap(&scratch_arena, &word_map);
 }
 
