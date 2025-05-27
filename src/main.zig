@@ -1,5 +1,4 @@
-var _GPA = std.heap.GeneralPurposeAllocator(.{}).init;
-const GPA = _GPA.allocator();
+const GPA = std.heap.raw_c_allocator;
 
 var STDERR = std.io.getStdErr().writer();
 var STDOUT = std.io.getStdOut().writer();
