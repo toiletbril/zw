@@ -13,8 +13,8 @@ var STDOUT = std.io.getStdOut().writer();
 
 // TODO make a list of delimiters configurable at runtime.
 const ASCII_DELIMS = [_]u8{
-  '"', '\'', '*', '+', '%', '\\', '/', ' ', ',', '(', ')', '[', ']', '{',
-  '}', '<', '>', '`', '|', '=', ':', ';', '\t', '\n', '\r', 0,
+  '"', '\'', '*', '+', '%', '\\', '/', ' ', ',', '.', '(', ')', '[', ']', '{',
+  '}', '<', '>', '`', '|', '=', ':', ';', '&', '^', '\t', '\n', '\r', 0,
 };
 
 fn isDelimiter(b: u8) bool
@@ -240,11 +240,11 @@ fn printWordMap(scratch_arena: *std.heap.ArenaAllocator,
   var total_count = @as(u64, 0);
   var total_word_count = @as(u64, 0);
   for (sorted_wordmap.items) |e| {
-    _ = try out_writer.print("{}\t\t{s}\n", .{ e.value_ptr.*, e.key_ptr.* });
+    _ = try out_writer.print("{: <16} {s}\n", .{ e.value_ptr.*, e.key_ptr.* });
     total_word_count += 1;
     total_count += e.value_ptr.*;
   }
-  _ = try out_writer.print("{}\t{}\n", .{ total_count, total_word_count });
+  _ = try out_writer.print("{: <16} {}\n", .{ total_count, total_word_count });
 
   try out.flush();
 }
