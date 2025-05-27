@@ -15,7 +15,19 @@ fn isDelimiter(b: u8) bool
   return false;
 }
 
-const WordMap = std.StringHashMap(u64);
+const WordMapContext = struct {
+  const Hash = std.hash.RapidHash;
+  pub fn hash(_: @This(), key: []const u8) u64
+  {
+    return Hash.hash(0, key);
+  }
+  pub fn eql(_: @This(), a: []const u8, b: []const u8) bool
+  {
+    return std.mem.eql(u8, a, b);
+  }
+};
+
+const WordMap = std.HashMap([]const u8, u64, WordMapContext, 99);
 
 fn addWordToWordMap(word_arena: *std.heap.ArenaAllocator,
                     word_map: *WordMap, word: []const u8) !void
