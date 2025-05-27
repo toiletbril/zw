@@ -4,13 +4,14 @@
 
 // SIMD-accelerated word counter.
 // Extracts count of each word from a file. A word is consists of either ASCII
-// or Unicode, binary is ignored.
+// or Unicode. Binary is ignored.
 
 var RAW_ALLOCATOR = std.heap.raw_c_allocator;
 
 var STDERR = std.io.getStdErr().writer();
 var STDOUT = std.io.getStdOut().writer();
 
+// TODO make a list of delimiters configurable at runtime.
 const ASCII_DELIMS = [_]u8{
   '"', '\'', '*', '+', '%', '\\', '/', ' ', ',', '(', ')', '[', ']', '{',
   '}', '<', '>', '`', '|', '=', ':', ';', '\t', '\n', '\r', 0,
@@ -50,6 +51,9 @@ fn cpuSupports(feature: std.Target.x86.Feature) bool
   return std.Target.x86.featureSetHas(builtin.cpu.features, feature);
 }
 
+// TODO improve the parsing of binary files.
+// TODO multithreading.
+// TODO low-memory path.
 fn parseFileToWordMap(word_arena: *std.heap.ArenaAllocator,
                       scratch_arena: *std.heap.ArenaAllocator,
                       word_map: *WordMap,
@@ -103,9 +107,8 @@ fn parseFileToWordMap(word_arena: *std.heap.ArenaAllocator,
 
         // make sure the entire lane is ascii.
         if (@reduce(.Or, lane.* & ct_ascii_mask) != 0) break :ascii;
-        // type width must match lane_width.
+        // build a delimiter mask.
         var delimiter_mask: SimdMask = 0;
-        // build delimiter mask OR-ing every comparison.
         inline for (ct_delim_splats) |d|
           delimiter_mask |= @bitCast(lane.* == d);
         if (delimiter_mask == 0) {
@@ -264,6 +267,7 @@ fn streq(a: []const u8, b: []const u8) bool
   return std.mem.eql(u8, a, b);
 }
 
+// TODO proper cli options.
 fn entry() !void
 {
   var word_map = WordMap.init(RAW_ALLOCATOR);
@@ -289,17 +293,20 @@ fn entry() !void
       try std.fs.cwd().openFile(arg, .{ .mode = .read_only });
 
     defer file.close();
+    std.log.debug("file is: '{s}'", .{ arg });
 
     // proper values below affect the speed heavily.
     const average_word_size = 8;
     const average_word_repetitions = 32;
 
     all_files_size += (try file.stat()).size;
+    std.log.debug("total file size: {}", .{ all_files_size });
 
     // preheat the map.
     const estimated_map_length: u32 =
       @truncate(all_files_size / average_word_size / average_word_repetitions);
     try word_map.ensureTotalCapacity(estimated_map_length);
+    std.log.debug("map capacity: {}", .{ word_map.capacity() });
 
     // preheat the arena.
     if (word_arena.queryCapacity() < all_files_size) {
@@ -308,6 +315,7 @@ fn entry() !void
         @truncate(all_files_size / average_word_repetitions);
       wa.free(try wa.alloc(u8, estimated_arena_size));
     }
+    std.log.debug("word arena capacity: {}", .{ word_arena.queryCapacity() });
 
     var any_file_reader = file.reader().any();
     try parseFileToWordMap(&word_arena, &scratch_arena, &word_map,
