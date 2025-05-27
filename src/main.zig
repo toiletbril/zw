@@ -249,9 +249,11 @@ fn error_main() !void
   defer args.deinit();
   // skip program name.
   const program_name = args.next().?;
+  var all_files_size: u128 = 0;
 
   while (args.next()) |arg| {
     if (streq(arg, "--help")) return help(program_name);
+
     // "-" is stdin.
     var file = if (streq(arg, "-"))
       std.io.getStdIn()
@@ -260,10 +262,23 @@ fn error_main() !void
 
     defer file.close();
 
-    // preallocate some memory based on a file size.
-    const stat = try file.stat();
-    const estimated_entries: u32 = @truncate(stat.size / 6);
-    try word_map.ensureTotalCapacity(estimated_entries);
+    const average_word_size = 8;
+    const average_word_repetitions = 32;
+
+    all_files_size += (try file.stat()).size;
+
+    // preheat the map.
+    const estimated_map_length: u32 =
+      @truncate(all_files_size / average_word_size / average_word_repetitions);
+    try word_map.ensureTotalCapacity(estimated_map_length);
+
+    // preheat the arena.
+    if (word_arena.queryCapacity() < all_files_size) {
+      const wa = word_arena.allocator();
+      const estimated_arena_size: usize =
+        @truncate(all_files_size / average_word_repetitions);
+      wa.free(try wa.alloc(u8, estimated_arena_size));
+    }
 
     var any_file_reader = file.reader().any();
     try parseFileToWordMap(&word_arena, &scratch_arena, &word_map,
