@@ -17,14 +17,16 @@ fn isDelimiter(b: u8) bool
 
 const WordMap = std.StringHashMap(u64);
 
-fn addWordToWordMap(word_map: *WordMap, word: []const u8) !void
+fn addWordToWordMap(word_arena: *std.heap.ArenaAllocator,
+                    word_map: *WordMap, word: []const u8) !void
 {
-  const actual_word = try GPA.dupe(u8, word);
+  const actual_word = try word_arena.allocator().dupe(u8, word);
   const entry = try word_map.getOrPutValue(actual_word, 0);
   entry.value_ptr.* += 1;
 }
 
-fn parseFileToWordMap(scratch_arena: *std.heap.ArenaAllocator,
+fn parseFileToWordMap(word_arena: *std.heap.ArenaAllocator,
+                      scratch_arena: *std.heap.ArenaAllocator,
                       word_map: *WordMap,
                       file_reader: *std.io.AnyReader) !void
 {
@@ -88,7 +90,7 @@ fn parseFileToWordMap(scratch_arena: *std.heap.ArenaAllocator,
 
           try word_buf.appendSlice(read_buf.items[prev_buf_idx..lane_off]);
           if (word_buf.items.len != 0) {
-            try addWordToWordMap(word_map, word_buf.items);
+            try addWordToWordMap(word_arena, word_map, word_buf.items);
             word_buf.clearRetainingCapacity();
           }
 
@@ -96,8 +98,7 @@ fn parseFileToWordMap(scratch_arena: *std.heap.ArenaAllocator,
 
           // append the delimiter itself.
           if (!std.ascii.isWhitespace(byte) and !std.ascii.isControl(byte))
-            try addWordToWordMap(word_map, &[1]u8{byte});
-
+            try addWordToWordMap(word_arena, word_map, &[1]u8{byte});
           prev_buf_idx = lane_off + 1;
         }
 
@@ -140,12 +141,12 @@ fn parseFileToWordMap(scratch_arena: *std.heap.ArenaAllocator,
       if (isDelimiter(cp[0])) {
         // add a word we collected to the word map.
         if (word_buf.items.len > 0) {
-          try addWordToWordMap(word_map, word_buf.items);
+          try addWordToWordMap(word_arena, word_map, word_buf.items);
           word_buf.clearRetainingCapacity();
         }
         // add this delimiter as well.
         if (!std.ascii.isWhitespace(cp[0]) and !std.ascii.isControl(cp[0]))
-          try addWordToWordMap(word_map, cp[0..1]);
+          try addWordToWordMap(word_arena, word_map, cp[0..1]);
       } else if (!std.ascii.isControl(cp[0])) {
         // or append this codepoint to word buffer.
         try word_buf.appendSlice(cp);
@@ -165,7 +166,8 @@ fn parseFileToWordMap(scratch_arena: *std.heap.ArenaAllocator,
     }
   }
 
-  if (word_buf.items.len > 0) try addWordToWordMap(word_map, word_buf.items);
+  if (word_buf.items.len > 0)
+    try addWordToWordMap(word_arena, word_map, word_buf.items);
 }
 
 fn compareWordMapEntry(_: void, a: WordMap.Entry, b: WordMap.Entry) bool
@@ -224,11 +226,15 @@ fn streq(a: []const u8, b: []const u8) bool
 
 fn error_main() !void
 {
-  var word_map = WordMap.initContext(GPA, .{});
+  var word_map = WordMap.init(GPA);
   defer word_map.deinit();
 
   var scratch_arena = std.heap.ArenaAllocator.init(GPA);
+  defer scratch_arena.deinit();
+  var word_arena = std.heap.ArenaAllocator.init(GPA);
+  defer word_arena.deinit();
   var args = try std.process.argsWithAllocator(GPA);
+  defer args.deinit();
   // skip program name.
   const program_name = args.next().?;
 
@@ -248,7 +254,8 @@ fn error_main() !void
     try word_map.ensureTotalCapacity(estimated_entries);
 
     var any_file_reader = file.reader().any();
-    try parseFileToWordMap(&scratch_arena, &word_map, &any_file_reader);
+    try parseFileToWordMap(&word_arena, &scratch_arena, &word_map,
+                           &any_file_reader);
   }
 
   try printWordMap(&scratch_arena, &word_map);
