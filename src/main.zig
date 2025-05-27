@@ -198,24 +198,31 @@ fn sortWordMapEntries(scratch_arena: *std.heap.ArenaAllocator,
   return sorted_wordmap;
 }
 
+pub fn veryBufferedWriter(underlying_stream: anytype)
+  std.io.BufferedWriter(std.heap.pageSize() * 16, @TypeOf(underlying_stream))
+{
+    return .{ .unbuffered_writer = underlying_stream };
+}
+
 fn printWordMap(scratch_arena: *std.heap.ArenaAllocator,
                 word_map: *WordMap) !void
 {
   const sorted_wordmap = try sortWordMapEntries(scratch_arena, word_map);
   defer _ = scratch_arena.reset(.retain_capacity);
 
-  var stdout = std.io.bufferedWriter(STDOUT);
-  var total_count = @as(u64, 0);
-  var stdout_writer = stdout.writer();
+  var out = veryBufferedWriter(STDOUT);
+  var out_writer = out.writer();
 
+  var total_count = @as(u64, 0);
+  var total_word_count = @as(u64, 0);
   for (sorted_wordmap.items) |e| {
-    _ = try stdout_writer
-                  .print("{}\t\t{s}\n", .{ e.value_ptr.*, e.key_ptr.* });
+    _ = try out_writer.print("{}\t\t{s}\n", .{ e.value_ptr.*, e.key_ptr.* });
+    total_word_count += 1;
     total_count += e.value_ptr.*;
   }
-  _ = try stdout_writer.print("{}\n", .{ total_count });
+  _ = try out_writer.print("{}\t{}\n", .{ total_count, total_word_count });
 
-  try stdout.flush();
+  try out.flush();
 }
 
 fn help(program_name: [:0]const u8) !void
