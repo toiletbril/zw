@@ -1,7 +1,12 @@
+# zig cache
 zig-out/
 .zig-cache/
+# profiling
+.gdb_history
 massif.out.*
 *.perf
-hs
-enwik8
-enwik9
+perf.*
+flamegraph.svg
+# data
+hs/
+enwik*
