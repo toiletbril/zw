@@ -1,4 +1,12 @@
-const GPA = std.heap.raw_c_allocator;
+// Copyright (c) 2025 toiletbril. All rights reserved.
+// Use of this source code is governed by a GPLv3 license that can be
+// found in the LICENSE file in top directory.
+
+// SIMD-accelerated word counter.
+// Extracts count of each word from a file. A word is consists of either ASCII
+// or Unicode, binary is ignored.
+
+var RAW_ALLOCATOR = std.heap.raw_c_allocator;
 
 var STDERR = std.io.getStdErr().writer();
 var STDOUT = std.io.getStdOut().writer();
@@ -32,8 +40,9 @@ fn addWordToWordMap(word_arena: *std.heap.ArenaAllocator,
                     word_map: *WordMap, word: []const u8) !void
 {
   const actual_word = try word_arena.allocator().dupe(u8, word);
-  const entry = try word_map.getOrPutValue(actual_word, 0);
-  entry.value_ptr.* += 1;
+  // NOTE the call below consumes ~50% of the entire runtime =D
+  const word_entry = try word_map.getOrPutValue(actual_word, 0);
+  word_entry.value_ptr.* += 1;
 }
 
 fn cpuSupports(feature: std.Target.x86.Feature) bool
@@ -210,10 +219,10 @@ fn sortWordMapEntries(scratch_arena: *std.heap.ArenaAllocator,
   return sorted_wordmap;
 }
 
-pub fn veryBufferedWriter(underlying_stream: anytype)
-  std.io.BufferedWriter(std.heap.pageSize() * 16, @TypeOf(underlying_stream))
+pub fn veryBufferedWriter(file: anytype)
+  std.io.BufferedWriter(std.heap.pageSize() * 16, @TypeOf(file))
 {
-    return .{ .unbuffered_writer = underlying_stream };
+  return .{ .unbuffered_writer = file };
 }
 
 fn printWordMap(scratch_arena: *std.heap.ArenaAllocator,
@@ -255,16 +264,16 @@ fn streq(a: []const u8, b: []const u8) bool
   return std.mem.eql(u8, a, b);
 }
 
-fn error_main() !void
+fn entry() !void
 {
-  var word_map = WordMap.init(GPA);
+  var word_map = WordMap.init(RAW_ALLOCATOR);
   defer word_map.deinit();
 
-  var scratch_arena = std.heap.ArenaAllocator.init(GPA);
+  var scratch_arena = std.heap.ArenaAllocator.init(RAW_ALLOCATOR);
   defer scratch_arena.deinit();
-  var word_arena = std.heap.ArenaAllocator.init(GPA);
+  var word_arena = std.heap.ArenaAllocator.init(RAW_ALLOCATOR);
   defer word_arena.deinit();
-  var args = try std.process.argsWithAllocator(GPA);
+  var args = try std.process.argsWithAllocator(RAW_ALLOCATOR);
   defer args.deinit();
   // skip program name.
   const program_name = args.next().?;
@@ -281,6 +290,7 @@ fn error_main() !void
 
     defer file.close();
 
+    // proper values below affect the speed heavily.
     const average_word_size = 8;
     const average_word_repetitions = 32;
 
@@ -309,7 +319,7 @@ fn error_main() !void
 
 pub fn main() !void
 {
-  error_main() catch |err| std.process.fatal("{any}.", .{ err });
+  entry() catch |err| std.process.fatal("{any}.", .{ err });
   std.process.cleanExit();
 }
 
