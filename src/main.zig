@@ -253,8 +253,9 @@ fn help(program_name: [:0]const u8) !void
 {
   STDERR.print(
 \\USAGE
-\\  {s} [-OPTIONS] <file1> [, file2, ..]
-\\  Extract count of each word from a file. If file is "-", use standard input.
+\\  {s} [-OPTIONS] [file1, file2, ..]
+\\  Extract count of each word from a file. When no file specified, or if the
+\\  file is "-", use standard input.
 \\
 \\OPTIONS
 \\      --help                      Display help message.
@@ -282,18 +283,29 @@ fn entry() !void
   // skip program name.
   const program_name = args.next().?;
   var all_files_size: u128 = 0;
+  var is_first_file = true;
 
-  while (args.next()) |arg| {
-    if (streq(arg, "--help")) return help(program_name);
+  while (true) {
+    var file_name: []const u8 = undefined;
+    if (args.next()) |arg| {
+      file_name = arg;
+    } else if (is_first_file) {
+      // first iteration and no arguments -- use stdin.
+      file_name = "-";
+    } else {
+      break;
+    }
+    is_first_file = false;
+
+    if (streq(file_name, "--help")) return help(program_name);
 
     // "-" is stdin.
-    var file = if (streq(arg, "-"))
-      std.io.getStdIn()
-    else
-      try std.fs.cwd().openFile(arg, .{ .mode = .read_only });
+    var file =
+      if (streq(file_name, "-")) std.io.getStdIn()
+      else try std.fs.cwd().openFile(file_name, .{ .mode = .read_only });
 
     defer file.close();
-    std.log.debug("file is: '{s}'", .{ arg });
+    std.log.debug("file is: '{s}'", .{ file_name });
 
     // proper values below affect the speed heavily.
     const average_word_size = 8;
