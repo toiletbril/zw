@@ -37,6 +37,11 @@ fn addWordToWordMap(word_arena: *std.heap.ArenaAllocator,
   entry.value_ptr.* += 1;
 }
 
+fn cpuSupports(feature: std.Target.x86.Feature) bool
+{
+  return std.Target.x86.featureSetHas(builtin.cpu.features, feature);
+}
+
 fn parseFileToWordMap(word_arena: *std.heap.ArenaAllocator,
                       scratch_arena: *std.heap.ArenaAllocator,
                       word_map: *WordMap,
@@ -46,68 +51,80 @@ fn parseFileToWordMap(word_arena: *std.heap.ArenaAllocator,
   const scratch_allocator = scratch_arena.allocator();
 
   var read_buf = std.ArrayList(u8).init(scratch_allocator);
-  try read_buf.resize(std.heap.pageSize() * 64);
+  try read_buf.resize(std.heap.pageSize() * 256); // a MB or more
 
-  var word_buf = try std.ArrayList(u8).initCapacity(scratch_allocator, 16);
+  var word_buf = try std.ArrayList(u8).initCapacity(scratch_allocator, 32);
   var n_read = try file_reader.read(read_buf.items);
   var truncated_buf: [3]u8 = undefined;
   var truncated_cp_sz = @as(u3, 0);
 
-  // comptime simd constants.
-  const lane_width = 16;
-  const SimdLane = comptime @Vector(lane_width, u8);
-  const ascii_mask: SimdLane = comptime @splat(0x80);
-  // build one splat per delimiter once.
-  comptime var delim_splats: [ASCII_DELIMS.len]SimdLane = undefined;
+  // prepare for takeoff.
+  const ct_lane_width =
+    comptime if (cpuSupports(.avx512bw)) 64
+    else if (cpuSupports(.avx2)) 32
+    else if (cpuSupports(.sse4_2)) 16
+    else 8;
+  const SimdMask =
+    comptime switch (ct_lane_width) {
+      64 => u64,
+      32 => u32,
+      16 => u16,
+      else => u8,
+    };
+  const SimdLane = comptime @Vector(ct_lane_width, u8);
+
+  const ct_ascii_mask: SimdLane = comptime @splat(0x80);
+  // build one splat per delimiter.
+  comptime var ct_delim_splats: [ASCII_DELIMS.len]SimdLane = undefined;
   comptime {
-    for (&delim_splats, ASCII_DELIMS) |*dst, c| dst.* = @splat(c);
+    for (&ct_delim_splats, ASCII_DELIMS) |*dst, c| dst.* = @splat(c);
   }
 
   while (n_read > 0) {
     var buf_idx = @as(u64, 0);
-
     while (buf_idx < n_read) {
-      // simd ascii path.
+      // simd ascii path. fast if the entire lane is ascii, even faster if it's
+      // without any delimiters.
       if (std.ascii.isAscii(read_buf.items[buf_idx]) and
-          buf_idx + lane_width < n_read)
+          buf_idx + ct_lane_width < n_read)
       ascii: {
         // load a lane.
         const lane: *align(1) const SimdLane =
           @ptrCast(read_buf.items.ptr + buf_idx);
-        const lane_end = buf_idx + lane_width;
+        const lane_end = buf_idx + ct_lane_width;
 
         // make sure the entire lane is ascii.
-        if (@reduce(.Or, lane.* & ascii_mask) != 0) break :ascii;
-
-        var mask: u16 = 0; // must match lane_width.
+        if (@reduce(.Or, lane.* & ct_ascii_mask) != 0) break :ascii;
+        // type width must match lane_width.
+        var delimiter_mask: SimdMask = 0;
         // build delimiter mask OR-ing every comparison.
-        inline for (delim_splats) |d| mask |= @bitCast(lane.* == d);
-        if (mask == 0) {
-          // hooray, no delimiters in lane. append the entire buffer.
+        inline for (ct_delim_splats) |d|
+          delimiter_mask |= @bitCast(lane.* == d);
+        if (delimiter_mask == 0) {
+          // no delimiters in lane! append the entire buffer.
           try word_buf.appendSlice(read_buf.items[buf_idx..lane_end]);
-          buf_idx += lane_width;
+          buf_idx += ct_lane_width;
           continue;
         }
 
-        // slow-path: walk the 16 bytes, guided by the mask.
+        // slow path: walk the 16 bytes manually.
         var lane_idx: u8 = 0;
         var prev_buf_idx: u64 = buf_idx;
 
-        while (lane_idx < lane_width) : ({ mask >>= 1; lane_idx += 1; }) {
+        while (lane_idx < ct_lane_width)
+          : ({ delimiter_mask >>= 1; lane_idx += 1; })
+        {
           // wait for the delimiter.
-          if (mask & 1 == 0) continue;
-
+          if (delimiter_mask & 1 == 0) continue;
           const lane_off = buf_idx + lane_idx;
           std.debug.assert(prev_buf_idx <= lane_off);
-
+          // append the word.
           try word_buf.appendSlice(read_buf.items[prev_buf_idx..lane_off]);
           if (word_buf.items.len != 0) {
             try addWordToWordMap(word_arena, word_map, word_buf.items);
             word_buf.clearRetainingCapacity();
           }
-
           const byte = read_buf.items[lane_off];
-
           // append the delimiter itself.
           if (!std.ascii.isWhitespace(byte) and !std.ascii.isControl(byte))
             try addWordToWordMap(word_arena, word_map, &[1]u8{byte});
@@ -116,8 +133,7 @@ fn parseFileToWordMap(word_arena: *std.heap.ArenaAllocator,
 
         if (prev_buf_idx < lane_end)
           try word_buf.appendSlice(read_buf.items[prev_buf_idx..lane_end]);
-
-        buf_idx += lane_width;
+        buf_idx += ct_lane_width;
 
         continue;
       }
@@ -140,7 +156,6 @@ fn parseFileToWordMap(word_arena: *std.heap.ArenaAllocator,
         truncated_cp_sz = cp_sz;
         break;
       }
-
       // 2. retrieve the codepoint.
       const cp = read_buf.items[buf_idx..cp_end];
       // 3. validate the codepoint.
@@ -148,7 +163,6 @@ fn parseFileToWordMap(word_arena: *std.heap.ArenaAllocator,
         buf_idx += 1;
         continue;
       }
-
       // 4. check whether codepoint is a delimiter.
       if (isDelimiter(cp[0])) {
         // add a word we collected to the word map.
@@ -166,11 +180,10 @@ fn parseFileToWordMap(word_arena: *std.heap.ArenaAllocator,
 
       buf_idx += cp_sz;
     }
-
-    // read again. if the truncated buffer is not empty, put's it's contents in
-    // the beginning.
+    // read again.
     n_read = try file_reader.read(read_buf.items[truncated_cp_sz..]);
-
+    // if the truncated buffer is not empty, put's it's contents in the
+    // beginning.
     if (truncated_cp_sz > 0) {
       @memcpy(
         read_buf.items[0..truncated_cp_sz], truncated_buf[0..truncated_cp_sz]);
@@ -302,3 +315,4 @@ pub fn main() !void
 }
 
 const std = @import("std");
+const builtin = @import("builtin");
