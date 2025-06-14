@@ -11,60 +11,6 @@ var RAW_ALLOCATOR = std.heap.raw_c_allocator;
 var STDERR = std.io.getStdErr().writer();
 var STDOUT = std.io.getStdOut().writer();
 
-// TODO this is overcomplicated.
-// i almost allowed myself to like Zig, but suddenly
-// https://github.com/ziglang/zig/issues/2647.
-const ErrorStack = struct {
-  var buf_offset: u64 = 0;
-  var buf: [1024]u8 = std.mem.zeroes([1024]u8);
-
-  fn print(_: @This(), comptime fmt: []const u8, args: anytype) void
-  {
-    const s = std.fmt.bufPrint(
-      ErrorStack.buf[buf_offset..], fmt, args) catch unreachable;
-    buf_offset += s.len;
-  }
-
-  pub fn putError(self: @This(), comptime fmt: []const u8, args: anytype,
-                    msg: []const u8) void
-  {
-    self.print("got error while ", .{});
-    self.print(fmt, args);
-    self.print(": {s}.\n", .{ msg });
-  }
-
-  fn swapContextAndError(_: @This(), err_end: u64) void
-  {
-    var b = &ErrorStack.buf;
-    const ctx_end = buf_offset - err_end;
-    // put the error before end.
-    @memcpy(b[b.len-err_end..], b[0..err_end]);
-    // put context in the beginning.
-    @memcpy(b[0..ctx_end], b[err_end..buf_offset]);
-    // put the error after the context.
-    @memcpy(b[ctx_end..ctx_end+err_end], b[b.len-err_end..]);
-    // leave no trace behind.
-    @memset(b[b.len-err_end..], 0);
-  }
-
-  pub fn putContext(self: @This(),
-                      comptime fmt: []const u8, args: anytype) void
-  {
-    const e = ErrorStack.buf_offset;
-    self.print("when ", .{});
-    self.print(fmt, args);
-    self.print(", ", .{});
-    self.swapContextAndError(e);
-  }
-
-  pub fn getLogBuffer(_: @This()) []const u8
-  {
-    return &ErrorStack.buf;
-  }
-};
-
-var ERROR_LOG: ErrorStack = .{};
-
 fn describeStdError(err: anyerror) []const u8
 {
   return switch (err) {
@@ -75,26 +21,36 @@ fn describeStdError(err: anyerror) []const u8
   };
 }
 
+// apparently, designing an error system is an unsolved computer science
+// problem.
+const ErrorState = struct {
+  buffer: [1024]u8 = undefined,
+
+  fn setError(self: *@This(), err: anyerror, comptime fmt: []const u8,
+              args: anytype) void
+  {
+    const s = std.fmt.bufPrintZ(self.buffer[0..], fmt, args) catch unreachable;
+    _ = std.fmt.bufPrintZ(self.buffer[s.len..], ": {s}",
+                          .{ describeStdError(err) }) catch unreachable;
+  }
+
+  fn getError(self: *@This()) [:0]u8
+  {
+    return @ptrCast(&self.buffer);
+  }
+};
+
+var ERROR_STATE: ErrorState = .{};
+
 fn fail(err: anyerror, comptime fmt: []const u8, args: anytype) error{ Handled }
 {
   @branchHint(.cold);
   switch (err) {
     // do nothing if we failed already.
     error.Handled => {},
-    // add context.
-    error.NeedsContext => ERROR_LOG.putContext(fmt, args),
-    // ordinary path.
-    else => ERROR_LOG.putError(fmt, args, describeStdError(err)),
+    else => ERROR_STATE.setError(err, fmt, args),
   }
   return error.Handled;
-}
-
-fn failButNeedsContext(err: anyerror, comptime fmt: []const u8,
-                       args: anytype) error{ NeedsContext }
-{
-  @branchHint(.cold);
-  _ = fail(err, fmt, args) catch {};
-  return error.NeedsContext;
 }
 
 // TODO make a list of delimiters configurable at runtime.
@@ -111,10 +67,12 @@ fn isDelimiter(b: u8) bool
 
 const WordMapContext = struct {
   const Hash = std.hash.RapidHash;
+
   pub fn hash(_: @This(), key: []const u8) u64
   {
     return Hash.hash(0, key);
   }
+
   pub fn eql(_: @This(), a: []const u8, b: []const u8) bool
   {
     return std.mem.eql(u8, a, b);
@@ -127,11 +85,11 @@ fn addWordToWordMap(word_arena: *std.heap.ArenaAllocator,
                     word_map: *WordMap, word: []const u8) !void
 {
   const actual_word = word_arena.allocator().dupe(u8, word) catch |err| {
-    return fail(err, "copying word to the hash map", .{});
+    return fail(err, "OOM while copying word to the hash map", .{});
   };
   // NOTE the call below consumes ~50% of the entire runtime =D
   const word_entry = word_map.getOrPutValue(actual_word, 0) catch |err| {
-    return fail(err, "growing the hash map", .{});
+    return fail(err, "OOM while growing the hash map", .{});
   };
   word_entry.value_ptr.* += 1;
 }
@@ -146,7 +104,8 @@ fn cpuSupports(feature: std.Target.x86.Feature) bool
 // TODO low-memory path.
 
 // Doesn't handle read errors by itself.
-fn parseFileToWordMap(word_arena: *std.heap.ArenaAllocator,
+fn parseFileToWordMap(file_name: []const u8,
+                      word_arena: *std.heap.ArenaAllocator,
                       scratch_arena: *std.heap.ArenaAllocator,
                       word_map: *WordMap,
                       file_reader: *std.io.AnyReader) !void
@@ -159,10 +118,10 @@ fn parseFileToWordMap(word_arena: *std.heap.ArenaAllocator,
 
   var word_buf =
     std.ArrayList(u8).initCapacity(scratch_allocator, 32) catch |err| {
-      return fail(err, "initializing a temporary array for reading", .{});
+      return fail(err, "OOM while reading {s}", .{file_name});
     };
   var n_read = file_reader.read(read_buf.items) catch |err| {
-    return failButNeedsContext(err, "reading a file", .{});
+    return fail(err, "coulnd't read from `{s}`", .{file_name});
   };
   var truncated_buf: [3]u8 = undefined;
   var truncated_cp_sz = @as(u3, 0);
@@ -211,7 +170,7 @@ fn parseFileToWordMap(word_arena: *std.heap.ArenaAllocator,
         if (delimiter_mask == 0) {
           // no delimiters in lane! append the entire buffer.
           word_buf.appendSlice(read_buf.items[buf_idx..lane_end]) catch |err| {
-            return fail(err, "while reallocating temporary word buffer", .{});
+            return fail(err, "OOM while reading `{s}`", .{file_name});
           };
           buf_idx += ct_lane_width;
           continue;
@@ -231,7 +190,7 @@ fn parseFileToWordMap(word_arena: *std.heap.ArenaAllocator,
           // append the word.
           word_buf.appendSlice(
             read_buf.items[prev_buf_idx..lane_off]) catch |err| {
-              return fail(err, "while reallocating temporary word buffer", .{});
+              return fail(err, "OOM while reading `{s}`", .{file_name});
             };
           if (word_buf.items.len != 0) {
             try addWordToWordMap(word_arena, word_map, word_buf.items);
@@ -248,7 +207,7 @@ fn parseFileToWordMap(word_arena: *std.heap.ArenaAllocator,
         if (prev_buf_idx < lane_end) {
           word_buf.appendSlice(
             read_buf.items[prev_buf_idx..lane_end]) catch |err| {
-              return fail(err, "while reallocating temporary word buffer", .{});
+              return fail(err, "OOM while reading `{s}`", .{file_name});
             };
         }
         buf_idx += ct_lane_width;
@@ -294,7 +253,7 @@ fn parseFileToWordMap(word_arena: *std.heap.ArenaAllocator,
       } else if (!std.ascii.isControl(cp[0])) {
         // or append this codepoint to word buffer.
         word_buf.appendSlice(cp) catch |err| {
-          return fail(err, "while reallocating temporary word buffer", .{});
+          return fail(err, "OOM while reading `{s}`", .{file_name});
         };
       }
 
@@ -302,7 +261,7 @@ fn parseFileToWordMap(word_arena: *std.heap.ArenaAllocator,
     }
     // read again.
     n_read = file_reader.read(read_buf.items[truncated_cp_sz..]) catch |err| {
-      return failButNeedsContext(err, "reading a file", .{});
+      return fail(err, "OOM while reading `{s}`", .{file_name});
     };
     // if the truncated buffer is not empty, put's it's contents in the
     // beginning.
@@ -329,7 +288,7 @@ fn sortWordMapEntries(scratch_arena: *std.heap.ArenaAllocator,
   var sorted_wordmap =
     std.ArrayList(WordMap.Entry).init(scratch_arena.allocator());
   while (it.next()) |e| sorted_wordmap.append(e) catch |err| {
-    return fail(err, "sorting the hashmap", .{});
+    return fail(err, "OOM while sorting word map", .{});
   };
   std.mem.sort(WordMap.Entry, sorted_wordmap.items, {}, compareWordMapEntry);
   return sorted_wordmap;
@@ -373,8 +332,8 @@ fn help(program_name: [:0]const u8) !void
   STDERR.print(
 \\USAGE
 \\  {s} [-OPTIONS] [file1, file2, ..]
-\\  Extract count of each word from a file. When no file specified, or if the
-\\  file is "-", use standard input.
+\\  Extract count of each word from a file/set of files.
+\\  When no file specified, or if the file is "-", use standard input.
 \\
 \\OPTIONS
 \\      --help                      Display help message.
@@ -398,7 +357,7 @@ fn entry() !void
   var word_arena = std.heap.ArenaAllocator.init(RAW_ALLOCATOR);
   defer word_arena.deinit();
   var args = std.process.argsWithAllocator(RAW_ALLOCATOR) catch |err| {
-    fail(err, "allocating memory for CLI args", .{});
+    fail(err, "OOM while reading CLI arguments", .{});
   };
   defer args.deinit();
   // skip program name.
@@ -427,7 +386,7 @@ fn entry() !void
       else
         std.fs.cwd().openFile(file_name, .{ .mode = .read_only })
           catch |err| {
-            return fail(err, "opening `{s}`", .{ file_name });
+            return fail(err, "couldn't open `{s}`", .{ file_name });
           };
 
     defer file.close();
@@ -444,7 +403,7 @@ fn entry() !void
     const estimated_map_length: u32 =
       @truncate(all_files_size / average_word_size / average_word_repetitions);
     word_map.ensureTotalCapacity(estimated_map_length) catch |err| {
-      return fail(err, "increasing hashmap capacity", .{});
+      return fail(err, "OOM while increasing word map capacity", .{});
     };
     std.log.debug("map capacity: {}", .{ word_map.capacity() });
 
@@ -454,16 +413,17 @@ fn entry() !void
       const estimated_arena_size: usize =
         @truncate(all_files_size / average_word_repetitions);
       const heat = wa.alloc(u8, estimated_arena_size) catch |err| {
-        return fail(err, "preallocating memory for words", .{});
+        return fail(err, "OOM while preheating the word map", .{});
       };
       wa.free(heat);
     }
     std.log.debug("word arena capacity: {}", .{ word_arena.queryCapacity() });
 
     var any_file_reader = file.reader().any();
-    parseFileToWordMap(
-      &word_arena, &scratch_arena, &word_map, &any_file_reader) catch |err| {
-        return fail(err, "trying to parse `{s}`", .{ file_name });
+    parseFileToWordMap(file_name, &word_arena, &scratch_arena, &word_map,
+                       &any_file_reader)
+      catch |err| {
+        return fail(err, "while trying to parse `{s}`", .{ file_name });
       };
   }
 
@@ -474,7 +434,7 @@ pub fn main() !void
 {
   entry() catch |err| {
     if (err == error.Handled) {
-      STDERR.print("zw: {s}", .{ ERROR_LOG.getLogBuffer() }) catch unreachable;
+      STDERR.print("zw: error: {s}\n", .{ ERROR_STATE.getError() }) catch unreachable;
       std.process.exit(1);
     }
     unreachable; // unhandled error :(
