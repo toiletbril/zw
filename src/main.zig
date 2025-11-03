@@ -8,8 +8,8 @@
 
 var RAW_ALLOCATOR = std.heap.raw_c_allocator;
 
-var STDERR = std.io.getStdErr().writer();
-var STDOUT = std.io.getStdOut().writer();
+var STDERR = std.fs.File.stderr().deprecatedWriter();
+var STDOUT = std.fs.File.stdout().deprecatedWriter();
 
 fn describeStdError(err: anyerror) []const u8
 {
@@ -66,7 +66,7 @@ fn isDelimiter(b: u8) bool
 }
 
 const WordMapContext = struct {
-  const Hash = std.hash.RapidHash;
+  const Hash = std.hash.XxHash3;
 
   pub fn hash(_: @This(), key: []const u8) u64
   {
@@ -108,19 +108,19 @@ fn parseFileToWordMap(file_name: []const u8,
                       word_arena: *std.heap.ArenaAllocator,
                       scratch_arena: *std.heap.ArenaAllocator,
                       word_map: *WordMap,
-                      file_reader: *std.io.AnyReader) !void
+                      file: std.fs.File) !void
 {
   defer _ = scratch_arena.reset(.retain_capacity);
   const scratch_allocator = scratch_arena.allocator();
 
-  var read_buf = std.ArrayList(u8).init(scratch_allocator);
+  var read_buf = std.array_list.Managed(u8).init(scratch_allocator);
   try read_buf.resize(std.heap.pageSize() * 256); // a MB or more
 
   var word_buf =
-    std.ArrayList(u8).initCapacity(scratch_allocator, 32) catch |err| {
+    std.array_list.Managed(u8).initCapacity(scratch_allocator, 32) catch |err| {
       return fail(err, "OOM while reading {s}", .{file_name});
     };
-  var n_read = file_reader.read(read_buf.items) catch |err| {
+  var n_read = file.read(read_buf.items) catch |err| {
     return fail(err, "coulnd't read from `{s}`", .{file_name});
   };
   var truncated_buf: [3]u8 = undefined;
@@ -260,7 +260,7 @@ fn parseFileToWordMap(file_name: []const u8,
       buf_idx += cp_sz;
     }
     // read again.
-    n_read = file_reader.read(read_buf.items[truncated_cp_sz..]) catch |err| {
+    n_read = file.read(read_buf.items[truncated_cp_sz..]) catch |err| {
       return fail(err, "OOM while reading `{s}`", .{file_name});
     };
     // if the truncated buffer is not empty, put's it's contents in the
@@ -282,22 +282,16 @@ fn compareWordMapEntry(_: void, a: WordMap.Entry, b: WordMap.Entry) bool
 }
 
 fn sortWordMapEntries(scratch_arena: *std.heap.ArenaAllocator,
-                      word_map: *const WordMap) !std.ArrayList(WordMap.Entry)
+                      word_map: *const WordMap) !std.array_list.Managed(WordMap.Entry)
 {
   var it = word_map.iterator();
   var sorted_wordmap =
-    std.ArrayList(WordMap.Entry).init(scratch_arena.allocator());
+    std.array_list.Managed(WordMap.Entry).init(scratch_arena.allocator());
   while (it.next()) |e| sorted_wordmap.append(e) catch |err| {
     return fail(err, "OOM while sorting word map", .{});
   };
   std.mem.sort(WordMap.Entry, sorted_wordmap.items, {}, compareWordMapEntry);
   return sorted_wordmap;
-}
-
-pub fn veryBufferedWriter(file: anytype)
-  std.io.BufferedWriter(std.heap.pageSize() * 16, @TypeOf(file))
-{
-  return .{ .unbuffered_writer = file };
 }
 
 fn printWordMap(scratch_arena: *std.heap.ArenaAllocator,
@@ -306,25 +300,20 @@ fn printWordMap(scratch_arena: *std.heap.ArenaAllocator,
   const sorted_wordmap = try sortWordMapEntries(scratch_arena, word_map);
   defer _ = scratch_arena.reset(.retain_capacity);
 
-  var out = veryBufferedWriter(STDOUT);
-  var out_writer = out.writer();
-
   var total_count = @as(u64, 0);
   var total_word_count = @as(u64, 0);
   for (sorted_wordmap.items) |e| {
-    _ = out_writer.print(
+    _ = STDOUT.print(
       "{: <16} {s}\n", .{ e.value_ptr.*, e.key_ptr.* }) catch |err| {
         return fail(err, "writing to stdout", .{});
       };
     total_word_count += 1;
     total_count += e.value_ptr.*;
   }
-  _ = out_writer.print(
+  _ = STDOUT.print(
     "{: <16} {}\n", .{ total_count, total_word_count }) catch |err| {
       return fail(err, "writing to stdout", .{});
     };
-
-  try out.flush();
 }
 
 fn help(program_name: [:0]const u8) !void
@@ -382,7 +371,7 @@ fn entry() !void
     // "-" is stdin.
     var file =
       if
-        (streq(file_name, "-")) std.io.getStdIn()
+        (streq(file_name, "-")) std.fs.File.stdin()
       else
         std.fs.cwd().openFile(file_name, .{ .mode = .read_only })
           catch |err| {
@@ -419,9 +408,8 @@ fn entry() !void
     }
     std.log.debug("word arena capacity: {}", .{ word_arena.queryCapacity() });
 
-    var any_file_reader = file.reader().any();
     parseFileToWordMap(file_name, &word_arena, &scratch_arena, &word_map,
-                       &any_file_reader)
+                       file)
       catch |err| {
         return fail(err, "while trying to parse `{s}`", .{ file_name });
       };
