@@ -79,7 +79,7 @@ const WordMapContext = struct {
   }
 };
 
-const WordMap = std.HashMap([]const u8, u64, WordMapContext, 99);
+const WordMap = std.HashMap([]const u8, u64, WordMapContext, 75);
 
 fn addWordToWordMap(word_arena: *std.heap.ArenaAllocator,
                     word_map: *WordMap, word: []const u8) !void
@@ -100,8 +100,154 @@ fn cpuSupports(feature: std.Target.x86.Feature) bool
 }
 
 // TODO improve the parsing of binary files.
-// TODO multithreading.
 // TODO low-memory path.
+
+// Parse a memory slice (for mmap'd files).
+fn parseMemoryToWordMap(chunk_data: []const u8,
+                        word_arena: *std.heap.ArenaAllocator,
+                        scratch_arena: *std.heap.ArenaAllocator,
+                        word_map: *WordMap) !void
+{
+  defer _ = scratch_arena.reset(.retain_capacity);
+  const scratch_allocator = scratch_arena.allocator();
+
+  var word_buf =
+    std.array_list.Managed(u8).initCapacity(scratch_allocator, 32) catch {
+      return error.OutOfMemory;
+    };
+
+  // prepare for takeoff.
+  const ct_lane_width =
+    comptime if (cpuSupports(.avx512bw)) 64
+    else if (cpuSupports(.avx2)) 32
+    else if (cpuSupports(.sse4_2)) 16
+    else 8;
+  const SimdMask =
+    comptime switch (ct_lane_width) {
+      64 => u64,
+      32 => u32,
+      16 => u16,
+      else => u8,
+    };
+  const SimdLane = comptime @Vector(ct_lane_width, u8);
+
+  const ct_ascii_mask: SimdLane = comptime @splat(0x80);
+  // build one splat per delimiter.
+  comptime var ct_delim_splats: [ASCII_DELIMS.len]SimdLane = undefined;
+  comptime {
+    for (&ct_delim_splats, ASCII_DELIMS) |*dst, c| dst.* = @splat(c);
+  }
+
+  var buf_idx = @as(u64, 0);
+  const n_read = chunk_data.len;
+
+  while (buf_idx < n_read) {
+    // simd ascii path. fast if the entire lane is ascii, even faster if it's
+    // without any delimiters.
+    if (std.ascii.isAscii(chunk_data[buf_idx]) and
+        buf_idx + ct_lane_width < n_read)
+    ascii: {
+      // load a lane.
+      const lane: *align(1) const SimdLane =
+        @ptrCast(chunk_data.ptr + buf_idx);
+      const lane_end = buf_idx + ct_lane_width;
+
+      // make sure the entire lane is ascii.
+      if (@reduce(.Or, lane.* & ct_ascii_mask) != 0) break :ascii;
+      // build a delimiter mask.
+      var delimiter_mask: SimdMask = 0;
+      inline for (ct_delim_splats) |d|
+        delimiter_mask |= @bitCast(lane.* == d);
+      if (delimiter_mask == 0) {
+        // no delimiters in lane! append the entire buffer.
+        word_buf.appendSlice(chunk_data[buf_idx..lane_end]) catch {
+          return error.OutOfMemory;
+        };
+        buf_idx += ct_lane_width;
+        continue;
+      }
+
+      // slow path: walk the bytes manually.
+      var lane_idx: u8 = 0;
+      var prev_buf_idx: u64 = buf_idx;
+
+      while (lane_idx < ct_lane_width)
+        : ({ delimiter_mask >>= 1; lane_idx += 1; })
+      {
+        // wait for the delimiter.
+        if (delimiter_mask & 1 == 0) continue;
+        const lane_off = buf_idx + lane_idx;
+        std.debug.assert(prev_buf_idx <= lane_off);
+        // append the word.
+        word_buf.appendSlice(chunk_data[prev_buf_idx..lane_off]) catch {
+          return error.OutOfMemory;
+        };
+        if (word_buf.items.len != 0) {
+          try addWordToWordMap(word_arena, word_map, word_buf.items);
+          word_buf.clearRetainingCapacity();
+        }
+        const byte = chunk_data[lane_off];
+        // append the delimiter itself.
+        if (!std.ascii.isWhitespace(byte) and !std.ascii.isControl(byte)) {
+          try addWordToWordMap(word_arena, word_map, &[1]u8{byte});
+        }
+        prev_buf_idx = lane_off + 1;
+      }
+
+      if (prev_buf_idx < lane_end) {
+        word_buf.appendSlice(chunk_data[prev_buf_idx..lane_end]) catch {
+          return error.OutOfMemory;
+        };
+      }
+      buf_idx += ct_lane_width;
+
+      continue;
+    }
+
+    // scalar/unicode path.
+
+    // 1. find out codepoint length.
+    const cp_sz =
+      std.unicode.utf8ByteSequenceLength(chunk_data[buf_idx]) catch {
+        buf_idx += 1;
+        continue;
+      };
+    std.debug.assert(cp_sz <= 4);
+    const cp_end = buf_idx + cp_sz;
+    // special case: codepoint was truncated at chunk end.
+    if (cp_end > n_read) {
+      break;
+    }
+    // 2. retrieve the codepoint.
+    const cp = chunk_data[buf_idx..cp_end];
+    // 3. validate the codepoint.
+    if (!std.unicode.utf8ValidateSlice(cp)) {
+      buf_idx += 1;
+      continue;
+    }
+    // 4. check whether codepoint is a delimiter.
+    if (isDelimiter(cp[0])) {
+      // add a word we collected to the word map.
+      if (word_buf.items.len > 0) {
+        try addWordToWordMap(word_arena, word_map, word_buf.items);
+        word_buf.clearRetainingCapacity();
+      }
+      // add this delimiter as well.
+      if (!std.ascii.isWhitespace(cp[0]) and !std.ascii.isControl(cp[0]))
+        try addWordToWordMap(word_arena, word_map, cp[0..1]);
+    } else if (!std.ascii.isControl(cp[0])) {
+      // or append this codepoint to word buffer.
+      word_buf.appendSlice(cp) catch {
+        return error.OutOfMemory;
+      };
+    }
+
+    buf_idx += cp_sz;
+  }
+
+  if (word_buf.items.len > 0)
+    try addWordToWordMap(word_arena, word_map, word_buf.items);
+}
 
 // Doesn't handle read errors by itself.
 fn parseFileToWordMap(file_name: []const u8,
@@ -300,20 +446,166 @@ fn printWordMap(scratch_arena: *std.heap.ArenaAllocator,
   const sorted_wordmap = try sortWordMapEntries(scratch_arena, word_map);
   defer _ = scratch_arena.reset(.retain_capacity);
 
+  const buf = scratch_arena.allocator().alloc(u8, std.heap.pageSize() * 16)
+    catch |err| {
+      return fail(err, "OOM while allocating output buffer", .{});
+    };
+  var out_writer = std.fs.File.stdout().writer(buf);
+  const out = &out_writer.interface;
+
   var total_count = @as(u64, 0);
   var total_word_count = @as(u64, 0);
   for (sorted_wordmap.items) |e| {
-    _ = STDOUT.print(
+    _ = out.print(
       "{: <16} {s}\n", .{ e.value_ptr.*, e.key_ptr.* }) catch |err| {
         return fail(err, "writing to stdout", .{});
       };
     total_word_count += 1;
     total_count += e.value_ptr.*;
   }
-  _ = STDOUT.print(
+  _ = out.print(
     "{: <16} {}\n", .{ total_count, total_word_count }) catch |err| {
       return fail(err, "writing to stdout", .{});
     };
+
+  try out.flush();
+}
+
+// Calculate delimiter-aligned boundaries for chunking.
+fn calculateBoundaries(mapped: []const u8, chunk_size: usize,
+                       allocator: std.mem.Allocator) !std.array_list.Managed(u64)
+{
+  const file_size = mapped.len;
+  const num_chunks = (file_size + chunk_size - 1) / chunk_size;
+
+  var boundaries = std.array_list.Managed(u64).init(allocator);
+  try boundaries.append(0);
+
+  for (1..num_chunks) |i| {
+    var offset = i * chunk_size;
+    // scan forward to next delimiter
+    while (offset < file_size and !isDelimiter(mapped[offset])) {
+      offset += 1;
+    }
+    // move past the delimiter
+    if (offset < file_size) offset += 1;
+    if (offset < file_size) {
+      try boundaries.append(offset);
+    }
+  }
+  try boundaries.append(file_size);
+
+  return boundaries;
+}
+
+const ThreadContext = struct {
+  chunk_data: []const u8,
+  word_arena: *std.heap.ArenaAllocator,
+  scratch_arena: *std.heap.ArenaAllocator,
+  word_map: *WordMap,
+};
+
+fn processChunk(ctx: ThreadContext) void
+{
+  parseMemoryToWordMap(ctx.chunk_data, ctx.word_arena, ctx.scratch_arena,
+                       ctx.word_map) catch {};
+}
+
+fn parseFileMmap(file: std.fs.File, file_size: u64,
+                 word_arena: *std.heap.ArenaAllocator,
+                 word_map: *WordMap) !void
+{
+  // mmap the file
+  const mapped = try std.posix.mmap(
+    null,
+    file_size,
+    std.posix.PROT.READ,
+    .{ .TYPE = .SHARED },
+    file.handle,
+    0
+  );
+  defer std.posix.munmap(mapped);
+
+  // calculate thread count (80% of cores)
+  const cpu_count = try std.Thread.getCpuCount();
+  const max_threads = @max(1, (cpu_count * 4) / 5);
+  const chunk_size = 512 * 1024 * 1024; // 512MB
+  const num_chunks = (file_size + chunk_size - 1) / chunk_size;
+  const actual_threads: usize = @min(max_threads, num_chunks);
+
+  std.log.debug("using {} threads for {} chunks", .{ actual_threads, num_chunks });
+
+  // calculate boundaries
+  var boundaries = try calculateBoundaries(mapped, chunk_size, RAW_ALLOCATOR);
+  defer boundaries.deinit();
+
+  // limit chunks to actual thread count
+  const chunks_to_process = @min(actual_threads, boundaries.items.len - 1);
+
+  // allocate per-thread resources
+  var thread_arenas = try RAW_ALLOCATOR.alloc(
+    std.heap.ArenaAllocator, chunks_to_process);
+  defer RAW_ALLOCATOR.free(thread_arenas);
+  var scratch_arenas = try RAW_ALLOCATOR.alloc(
+    std.heap.ArenaAllocator, chunks_to_process);
+  defer RAW_ALLOCATOR.free(scratch_arenas);
+  var thread_maps = try RAW_ALLOCATOR.alloc(WordMap, chunks_to_process);
+  defer RAW_ALLOCATOR.free(thread_maps);
+
+  for (0..chunks_to_process) |i| {
+    thread_arenas[i] = std.heap.ArenaAllocator.init(RAW_ALLOCATOR);
+    scratch_arenas[i] = std.heap.ArenaAllocator.init(RAW_ALLOCATOR);
+    thread_maps[i] = WordMap.init(RAW_ALLOCATOR);
+  }
+
+  // spawn threads
+  var pool: std.Thread.Pool = undefined;
+  try pool.init(.{ .allocator = RAW_ALLOCATOR, .n_jobs = @intCast(actual_threads) });
+
+  for (0..chunks_to_process) |i| {
+    const start = boundaries.items[i];
+    const end = boundaries.items[i + 1];
+    const chunk_slice = mapped[start..end];
+
+    try pool.spawn(processChunk, .{ThreadContext{
+      .chunk_data = chunk_slice,
+      .word_arena = &thread_arenas[i],
+      .scratch_arena = &scratch_arenas[i],
+      .word_map = &thread_maps[i],
+    }});
+  }
+
+  // wait for all threads
+  pool.deinit();
+
+  // calculate total entries for pre-allocation
+  var total_entries: usize = 0;
+  for (thread_maps) |*map| {
+    total_entries += map.count();
+  }
+  try word_map.ensureTotalCapacity(@intCast(total_entries));
+
+  // single-pass merge: directly merge thread_maps into word_map
+  // with proper string duplication into main word_arena
+  const wa = word_arena.allocator();
+  for (thread_maps) |*map| {
+    var it = map.iterator();
+    while (it.next()) |kv| {
+      // duplicate string into main word_arena
+      const word_copy = wa.dupe(u8, kv.key_ptr.*) catch |err| {
+        return fail(err, "OOM while copying word during merge", .{});
+      };
+      const gop = try word_map.getOrPutValue(word_copy, 0);
+      gop.value_ptr.* += kv.value_ptr.*;
+    }
+  }
+
+  // cleanup
+  for (0..chunks_to_process) |i| {
+    thread_maps[i].deinit();
+    scratch_arenas[i].deinit();
+    thread_arenas[i].deinit();
+  }
 }
 
 fn help(program_name: [:0]const u8) !void
@@ -381,38 +673,54 @@ fn entry() !void
     defer file.close();
     std.log.debug("file is: '{s}'", .{ file_name });
 
-    // proper values below affect the speed heavily.
-    const average_word_size = 8;
-    const average_word_repetitions = 32;
+    const stat = try file.stat();
+    const file_size = stat.size;
+    const is_regular_file = stat.kind == .file;
+    const use_mmap = is_regular_file and file_size >= 100 * 1024 * 1024;
 
-    all_files_size += (try file.stat()).size;
+    all_files_size += file_size;
     std.log.debug("total file size: {}", .{ all_files_size });
 
-    // preheat the map.
-    const estimated_map_length: u32 =
-      @truncate(all_files_size / average_word_size / average_word_repetitions);
-    word_map.ensureTotalCapacity(estimated_map_length) catch |err| {
-      return fail(err, "OOM while increasing word map capacity", .{});
-    };
-    std.log.debug("map capacity: {}", .{ word_map.capacity() });
-
-    // preheat the arena.
-    if (word_arena.queryCapacity() < all_files_size) {
-      const wa = word_arena.allocator();
-      const estimated_arena_size: usize =
-        @truncate(all_files_size / average_word_repetitions);
-      const heat = wa.alloc(u8, estimated_arena_size) catch |err| {
-        return fail(err, "OOM while preheating the word map", .{});
-      };
-      wa.free(heat);
-    }
-    std.log.debug("word arena capacity: {}", .{ word_arena.queryCapacity() });
-
-    parseFileToWordMap(file_name, &word_arena, &scratch_arena, &word_map,
-                       file)
-      catch |err| {
+    if (use_mmap) {
+      // use mmap + multithreading for large files
+      std.log.debug("using mmap for large file", .{});
+      parseFileMmap(file, file_size, &word_arena, &word_map) catch |err| {
         return fail(err, "while trying to parse `{s}`", .{ file_name });
       };
+    } else {
+      // use single-threaded read() for stdin/small files
+      std.log.debug("using read() for small file or stdin", .{});
+
+      // proper values below affect the speed heavily.
+      const average_word_size = 8;
+      const average_word_repetitions = 32;
+
+      // preheat the map.
+      const estimated_map_length: u32 =
+        @truncate(all_files_size / average_word_size / average_word_repetitions);
+      word_map.ensureTotalCapacity(estimated_map_length) catch |err| {
+        return fail(err, "OOM while increasing word map capacity", .{});
+      };
+      std.log.debug("map capacity: {}", .{ word_map.capacity() });
+
+      // preheat the arena.
+      if (word_arena.queryCapacity() < all_files_size) {
+        const wa = word_arena.allocator();
+        const estimated_arena_size: usize =
+          @truncate(all_files_size / average_word_repetitions);
+        const heat = wa.alloc(u8, estimated_arena_size) catch |err| {
+          return fail(err, "OOM while preheating the word map", .{});
+        };
+        wa.free(heat);
+      }
+      std.log.debug("word arena capacity: {}", .{ word_arena.queryCapacity() });
+
+      parseFileToWordMap(file_name, &word_arena, &scratch_arena, &word_map,
+                         file)
+        catch |err| {
+          return fail(err, "while trying to parse `{s}`", .{ file_name });
+        };
+    }
   }
 
   try printWordMap(&scratch_arena, &word_map);
