@@ -528,8 +528,8 @@ fn parseFileMmap(file: std.fs.File, file_size: u64,
 
   // calculate thread count (80% of cores)
   const cpu_count = try std.Thread.getCpuCount();
-  const max_threads = @max(1, (cpu_count * 4) / 5);
-  const chunk_size = 512 * 1024 * 1024; // 512MB
+  const max_threads = @max(1, (cpu_count * 9) / 10);
+  const chunk_size = 256 * 1024 * 1024; // 256 MB
   const num_chunks = (file_size + chunk_size - 1) / chunk_size;
   const actual_threads: usize = @min(max_threads, num_chunks);
 
